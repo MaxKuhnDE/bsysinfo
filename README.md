@@ -111,3 +111,7 @@ Die Resident Set Size ist der Teil des Speichers eines Prozesses, der tatsächli
 | Z (Zombie) | Der Prozess ist beendet, hat aber noch einen Eintrag in der Prozesstabelle, bis der Elternprozess seinen Exit-Status abholt. |
 | T (Stopped) | Der Prozess wurde durch ein Signal angehalten, z. B. mit `Strg+Z` (Job Control). Wird er von einem Debugger angehalten, zeigt Linux `t` (tracing stop). |
 | I (Idle) | Untätiger Kernel-Thread. BSysInfo zählt ihn zu den schlafenden Tasks. |
+
+## Entstehung
+
+Der Code ist im Rahmen des Praktikums entstanden. Diese Dokumentation wurde mit Hilfe von Claude (Anthropic) auf Basis der Abgabe erstellt.
