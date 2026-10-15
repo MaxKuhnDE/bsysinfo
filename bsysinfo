@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+import os
+import shutil
+import argparse
+import time
+import pwd
+
+def hole_system_laufzeit():
+    #System-Uptime lesen
+    try:
+        with open('/proc/uptime', 'r') as datei:
+            laufzeit_in_sekunden = float(datei.readline().split()[0])
+            return laufzeit_in_sekunden
+    except Exception:
+        return 0.0
+
+def hole_speicher_info():
+    #rAM/Swap Infos holen
+    speicher_daten = {}
+    try:
+        with open('/proc/meminfo', 'r') as datei:
+            for zeile in datei:
+                teile = zeile.split()
+                if len(teile) >= 2:
+                    schluessel = teile[0].rstrip(':')
+                    wert = int(teile[1])
+                    speicher_daten[schluessel] = wert
+    except Exception:
+        pass
+    return speicher_daten
+
+def hole_globale_cpu_zeiten():
+    #CPU-Zeiten (Idle/Non-Idle) lesen
+    try:
+        with open('/proc/stat', 'r') as datei:
+            for zeile in datei:
+                if zeile.startswith('cpu '):
+                    teile = [float(p) for p in zeile.split()[1:]]
+                    #Idle = idle (teile[3]) + iowait (teile[4])
+                    leerlauf = teile[3] + teile[4]
+                    #Non-Idle = user + nice + system + irq + softirq + steal
+                    beschaeftigt = teile[0] + teile[1] + teile[2] + teile[5] + teile[6] + teile[7]
+                    return leerlauf, beschaeftigt
+    except Exception:
+        pass
+    return 0.0, 0.0
+
+def hole_benutzername(benutzer_id):
+    #UID zu Username aufloesen
+    try:
+        return pwd.getpwuid(benutzer_id).pw_name
+    except KeyError:
+        return str(benutzer_id)
+
+def sammle_system_zustand(vorherige_cpu_zeit, vorherige_prozess_zeiten):
+    #System-/Prozessdaten sammeln, CPU-Auslastung (Delta) berechnen
+    #1. Globale CPU-Auslastung ermitteln
+    aktuelle_cpu_zeit = hole_globale_cpu_zeiten()
+    leerlauf_alt, beschaeftigt_alt = vorherige_cpu_zeit
+    leerlauf_neu, beschaeftigt_neu = aktuelle_cpu_zeit
+    
+    gesamt_differenz = (leerlauf_neu + beschaeftigt_neu) - (leerlauf_alt + beschaeftigt_alt)
+    if gesamt_differenz == 0:
+        gesamt_differenz = 1.0 #Verhindert Division by Zero
+
+    cpu_auslastung_gesamt = 0.0
+    leerlauf_differenz = leerlauf_neu - leerlauf_alt
+    if gesamt_differenz > 0:
+        cpu_auslastung_gesamt = ((gesamt_differenz - leerlauf_differenz) / gesamt_differenz) * 100.0
+
+    #2. Memory und Uptime lesen
+    speicher_daten = hole_speicher_info()
+    laufzeit = hole_system_laufzeit()
+    
+    gesamt_ram_kb = speicher_daten.get("MemTotal", 1)
+    #Seitengroesse fuer RAM-Berechnung holen
+    seiten_groesse = os.sysconf('SC_PAGE_SIZE') if hasattr(os, 'sysconf') else 4096
+    anzahl_kerne = os.cpu_count() or 1
+
+    #3. Prozesse lesen
+    prozess_liste = []
+    aktuelle_prozess_zeiten = {}
+    task_statistiken = {"gesamt": 0, "laufend": 0, "schlafend": 0, "gestoppt": 0, "zombie": 0}
+
+    try:
+        #Finde alle Ordner in /proc, deren Name eine Zahl (PID) ist
+        prozess_ids = [pid for pid in os.listdir('/proc') if pid.isdigit()]
+    except Exception:
+        prozess_ids = []
+
+    for pid in prozess_ids:
+        task_statistiken["gesamt"] += 1
+        stat_pfad = f"/proc/{pid}/stat"
+        status_pfad = f"/proc/{pid}/status"
+
+        try:
+            #Lese /proc/[PID]/stat für allgemeine Prozessinfos
+            with open(stat_pfad, 'r') as datei:
+                stat_daten = datei.read()
+            
+            #Name steht in Klammern, kann Leerzeichen enthalten
+            linke_klammer = stat_daten.find('(')
+            rechte_klammer = stat_daten.rfind(')')
+            
+            kommando = stat_daten[linke_klammer+1:rechte_klammer]
+            teile = stat_daten[rechte_klammer+2:].split()
+
+            zustand = teile[0]
+            eltern_pid = int(teile[1])
+            user_zeit = float(teile[11])
+            system_zeit = float(teile[12])
+            prioritaet = teile[15]
+            anzahl_threads = teile[17]
+            rss_seiten = float(teile[21]) #Resident Set Size in Pages
+            
+            #Status zaehlen
+            if zustand == 'R': task_statistiken["laufend"] += 1
+            elif zustand in ('S', 'D', 'I'): task_statistiken["schlafend"] += 1
+            elif zustand == 'T': task_statistiken["gestoppt"] += 1
+            elif zustand == 'Z': task_statistiken["zombie"] += 1
+
+            #Lese /proc/[PID]/status für die UID (Besitzer des Prozesses)
+            benutzer_id = 0
+            with open(status_pfad, 'r') as datei:
+                for zeile in datei:
+                    if zeile.startswith('Uid:'):
+                        benutzer_id = int(zeile.split()[1])
+                        break
+            
+            besitzer = hole_benutzername(benutzer_id)
+
+            #Prozess-CPU-Auslastung berechnen
+            gesamt_zeit = user_zeit + system_zeit
+            aktuelle_prozess_zeiten[pid] = gesamt_zeit
+
+            vorherige_zeit = vorherige_prozess_zeiten.get(pid, 0.0)
+            prozess_cpu_differenz = gesamt_zeit - vorherige_zeit
+            
+            #Prozentualer Anteil des Prozesses an der CPU (skaliert nach Anzahl der Cores)
+            cpu_prozent = (prozess_cpu_differenz / gesamt_differenz) * 100.0 * anzahl_kerne
+            
+            #Prozess-RAM-Auslastung berechnen
+            rss_kilobytes = (rss_seiten * seiten_groesse) / 1024
+            speicher_prozent = (rss_kilobytes / gesamt_ram_kb) * 100.0
+
+            prozess_liste.append({
+                "pid": int(pid),
+                "besitzer": besitzer,
+                "name": kommando,
+                "prioritaet": prioritaet,
+                "zustand": zustand,
+                "eltern_pid": eltern_pid,
+                "threads": anzahl_threads,
+                "cpu_prozent": cpu_prozent,
+                "speicher_prozent": speicher_prozent
+            })
+
+        except Exception:
+            #Prozess evtl. schon beendet
+            continue
+
+    return prozess_liste, aktuelle_cpu_zeit, aktuelle_prozess_zeiten, cpu_auslastung_gesamt, task_statistiken, speicher_daten, laufzeit
+
+def ausgabe_system_info(task_statistiken, speicher_daten, laufzeit, cpu_prozent_gesamt, benutzer_anzahl):
+    #System-Header ausgeben
+    minuten, sekunden = divmod(int(laufzeit), 60)
+    stunden, minuten = divmod(minuten, 60)
+    
+    print(f"System Uptime: {stunden:02d}:{minuten:02d}:{sekunden:02d} | Aktive Benutzer (anhand laufender Prozesse): {benutzer_anzahl}")
+    print(f"Tasks: {task_statistiken['gesamt']} gesamt, {task_statistiken['laufend']} laufend, "
+          f"{task_statistiken['schlafend']} schlafend, {task_statistiken['gestoppt']} gestoppt, "
+          f"{task_statistiken['zombie']} zombie")
+    
+    print(f"CPU-Auslastung gesamt: {cpu_prozent_gesamt:.1f}%")
+    
+    ram_gesamt = speicher_daten.get("MemTotal", 0) / 1024
+    ram_frei = speicher_daten.get("MemFree", 0) / 1024
+    ram_genutzt = ram_gesamt - ram_frei
+    print(f"RAM:  {ram_gesamt:>8.1f} MB gesamt | {ram_genutzt:>8.1f} MB genutzt | {ram_frei:>8.1f} MB frei")
+    
+    swap_gesamt = speicher_daten.get("SwapTotal", 0) / 1024
+    swap_frei = speicher_daten.get("SwapFree", 0) / 1024
+    swap_genutzt = swap_gesamt - swap_frei
+    print(f"Swap: {swap_gesamt:>8.1f} MB gesamt | {swap_genutzt:>8.1f} MB genutzt | {swap_frei:>8.1f} MB frei")
+    print("-" * shutil.get_terminal_size().columns)
+
+def ausgabe_prozess_tabelle(prozess_liste, max_zeilen=None):
+    #Prozesstabelle ausgeben (nach CPU%)
+    #Absteigend nach CPU-Auslastung sortieren
+    prozess_liste.sort(key=lambda x: x["cpu_prozent"], reverse=True)
+    
+    kopfzeile = f"{'PID':>7} | {'USER':<12} | {'Prozessname':<20} | {'PR':>3} | {'S':^1} | {'PPID':>7} | {'THR':>3} | {'CPU%':>5} | {'MEM%':>5}"
+    print(kopfzeile)
+    print("=" * shutil.get_terminal_size().columns)
+    
+    zaehler = 0
+    for prozess in prozess_liste:
+        if max_zeilen is not None and zaehler >= max_zeilen:
+            break
+        
+        #Name und User abschneiden, falls sie zu lang sind
+        name = prozess['name'][:20]
+        benutzer = prozess['besitzer'][:12]
+        
+        print(f"{prozess['pid']:>7} | {benutzer:<12} | {name:<20} | {prozess['prioritaet']:>3} | {prozess['zustand']:^1} | {prozess['eltern_pid']:>7} | {prozess['threads']:>3} | {prozess['cpu_prozent']:>5.1f} | {prozess['speicher_prozent']:>5.1f}")
+        zaehler += 1
+
+def ausgabe_prozess_baum(prozess_liste):
+    #Prozessbaum erstellen und ausgeben
+    prozess_baum = {}
+    prozess_info = {}
+    
+    #Zuordnung von Parent-PIDs zu Listen von Kind-PIDs
+    for prozess in prozess_liste:
+        eltern_pid = prozess['eltern_pid']
+        pid = prozess['pid']
+        if eltern_pid not in prozess_baum:
+            prozess_baum[eltern_pid] = []
+        prozess_baum[eltern_pid].append(pid)
+        prozess_info[pid] = prozess
+
+    #Finde die Wurzeln (Prozesse, deren PPID in der aktuellen Prozessliste nicht existiert)
+    alle_pids = set(prozess_info.keys())
+    wurzeln = []
+    for eltern_pid in prozess_baum.keys():
+        if eltern_pid not in alle_pids:
+            wurzeln.extend(prozess_baum[eltern_pid])
+    
+    wurzeln.sort()
+
+    #Rekursive Funktion zur Ausgabe des Baums
+    def ausgabe_knoten(pid, praefix="", ist_letzter=True, ist_wurzel=False):
+        prozess = prozess_info.get(pid)
+        if not prozess: return
+        
+        if ist_wurzel:
+            print(f"{prozess['pid']} ({prozess['name']})")
+            neuer_praefix = ""
+        else:
+            verbindung = "└── " if ist_letzter else "├── "
+            print(f"{praefix}{verbindung}{prozess['pid']} ({prozess['name']})")
+            neuer_praefix = praefix + ("    " if ist_letzter else "│   ")
+        
+        kinder = prozess_baum.get(pid, [])
+        kinder.sort()
+        for i, kind_pid in enumerate(kinder):
+            kind_ist_letzter = (i == len(kinder) - 1)
+            ausgabe_knoten(kind_pid, neuer_praefix, kind_ist_letzter, ist_wurzel=False)
+
+    print("Prozessbaum:")
+    for i, wurzel_pid in enumerate(wurzeln):
+        ausgabe_knoten(wurzel_pid, "", ist_letzter=(i == len(wurzeln)-1), ist_wurzel=True)
+
+def hauptprogramm():
+    #Argumente definieren
+    arg_parser = argparse.ArgumentParser(description="Terminalprogramm zur Anzeige von Prozess- und Betriebssysteminformationen")
+    arg_parser.add_argument("-a", "--all", action="store_true", help="Gibt einmalig alle aktuell laufenden Prozesse aus (ohne Höhenbegrenzung)")
+    arg_parser.add_argument("-t", "--tree", action="store_true", help="Gibt eine Baumstruktur der aktuell laufenden Prozesse aus")
+    argumente = arg_parser.parse_args()
+
+    #Erster Durchlauf nur fuer Referenzwerte    
+    _, vorherige_cpu_zeit, vorherige_prozess_zeiten, _, _, _, _ = sammle_system_zustand(hole_globale_cpu_zeiten(), {})
+    time.sleep(0.5)
+
+    if argumente.tree:
+        #Modus 3: Baumstruktur der Prozesse anzeigen
+        prozess_liste, _, _, _, _, _, _ = sammle_system_zustand(vorherige_cpu_zeit, vorherige_prozess_zeiten)
+        ausgabe_prozess_baum(prozess_liste)
+        
+    elif argumente.all:
+        #Modus 2: Alle Prozesse einmalig anzeigen (ohne Höhenlimit)
+        prozess_liste, _, _, cpu_auslastung_gesamt, task_statistiken, speicher_daten, laufzeit = sammle_system_zustand(vorherige_cpu_zeit, vorherige_prozess_zeiten)
+        
+        #Vereinfachte Zählung der User anhand der einmaligen Besitzer laufender Prozesse
+        eindeutige_benutzer = len(set(prozess['besitzer'] for prozess in prozess_liste))
+        
+        ausgabe_system_info(task_statistiken, speicher_daten, laufzeit, cpu_auslastung_gesamt, eindeutige_benutzer)
+        ausgabe_prozess_tabelle(prozess_liste, max_zeilen=None)
+        
+    else:
+        #Modus 1: Standard-Modus (kontinuierliche Schleife, max alle 3 Sekunden)
+        while True:
+            try:
+                #Terminal leeren
+                print("\033[H\033[J", end="")
+                
+                #Daten sammeln
+                prozess_liste, aktuelle_cpu_zeit, aktuelle_prozess_zeiten, cpu_auslastung_gesamt, task_statistiken, speicher_daten, laufzeit = sammle_system_zustand(vorherige_cpu_zeit, vorherige_prozess_zeiten)
+                
+                #Vereinfachte Zählung der aktiven Benutzer
+                eindeutige_benutzer = len(set(prozess['besitzer'] for prozess in prozess_liste))
+                
+                ausgabe_system_info(task_statistiken, speicher_daten, laufzeit, cpu_auslastung_gesamt, eindeutige_benutzer)
+                
+                #Verfuegbare Zeilen dynamisch berechnen = Terminal-Hoehe minus Header-Bereich (ca. 9 Zeilen Info + 2 Zeilen Tabellenkopf)
+                terminal_hoehe = shutil.get_terminal_size().lines
+                verfuegbare_zeilen = max(5, terminal_hoehe - 12)
+                
+                ausgabe_prozess_tabelle(prozess_liste, max_zeilen=verfuegbare_zeilen)
+                
+                #Werte für die nächste Iteration speichern
+                vorherige_cpu_zeit = aktuelle_cpu_zeit
+                vorherige_prozess_zeiten = aktuelle_prozess_zeiten
+                
+                #Aktualisierung alle 3 Sekunden
+                time.sleep(3)
+                
+            except KeyboardInterrupt:
+                #Sauberes Beenden per STRG+C
+                print("\nProgramm beendet.")
+                break
+
+if __name__ == "__main__":
+    hauptprogramm()
